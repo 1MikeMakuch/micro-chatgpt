@@ -2,7 +2,7 @@
 
 ## Introduction
 
-In this comprehensive guide, we'll build a working GPT (Generative Pre-trained Transformer) model entirely from scratch using pure C—no external libraries, no dependencies, just raw computational power.
+In this comprehensive guide, we'll build a working GPT (Generative Pre-trained Transformer) model entirely from scratch using pure C, no external libraries, no dependencies, just raw computational power.
 
 Let's build something remarkable together.
 
