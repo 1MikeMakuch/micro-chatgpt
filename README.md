@@ -6,7 +6,7 @@ The most atomic way to train and inference a GPT in pure, dependency-free C.
 Compile with optimizations:
 
 ```bash
-gcc -O3 -march=native -ffast-math -o gpt gpt.c -lm
+gcc -O3 -march=native -ffast-math -o microgpt microgpt.c -lm
 ```
 
 **Flags explained:**
@@ -18,7 +18,7 @@ gcc -O3 -march=native -ffast-math -o gpt gpt.c -lm
 Run:
 
 ```bash
-./gpt
+./microgpt
 ```
 
 You should see loss decreasing, then generated samples!
