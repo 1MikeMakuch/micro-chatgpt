@@ -1,5 +1,5 @@
 # Micro-ChatGPT
-The smallest GPT that can hold a human-like conversation, in pure C. Based on [microgpt-c](https://github.com/vixhal-baraiya/microgpt-c).
+The smallest GPT that can hold a human-like conversation, in pure C. Fored from [microgpt-c](https://github.com/vixhal-baraiya/microgpt-c).
 
 ## Usage
 
