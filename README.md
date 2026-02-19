@@ -1,24 +1,24 @@
-# MicroGPT-C
-The most atomic way to train and inference a GPT in pure, dependency-free C.
+# Micro-ChatGPT
+The smallest GPT that can hold a human-like conversation, in pure C. Based on [microgpt-c](https://github.com/vixhal-baraiya/microgpt-c).
 
-## Compilation and Running
-
-Compile with optimizations:
+## Usage
 
 ```bash
-gcc -O3 -march=native -ffast-math -o microgpt microgpt.c -lm
+make            # gcc -O3 -march=native -ffast-math -o micro-chatgpt micro-chatgpt.c -lm
+make train      # ./micro-chatgpt --data chat.txt --steps 30000 (1 or 2 mins)
+
+./micro-chatgpt --load model.bin --temperature 0.5
+
 ```
 
-**Flags explained:**
-- `-O3`: Maximum optimization
-- `-march=native`: Use CPU-specific instructions (AVX, etc.)
-- `-ffast-math`: Faster floating point (trades some precision)
-- `-lm`: Link math library (for sqrt, exp, etc.)
+## Options
 
-Run:
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--load FILE` | none | Load saved model, skip training |
+| `--save FILE` | `model.bin` | Save model after training |
+| `--data FILE` | `chat.txt` | Training data file |
+| `--steps N` | 30000 | Training steps |
+| `--temperature F` | 0.5 | Sampling temperature |
 
-```bash
-./microgpt
-```
-
-You should see loss decreasing, then generated samples!
+In interactive mode, type a prompt and press Enter. Type `quit` to exit.

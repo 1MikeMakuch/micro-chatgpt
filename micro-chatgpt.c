@@ -1,13 +1,15 @@
 /*
- * The most atomic way to train and inference a GPT in pure, dependency-free C.
+ * Micro-ChatGPT
+ * The smallest GPT that can hold a human-like conversation, built from scratch in pure C.
  * Optimized: manual forward/backward, float precision, cache-friendly.
  *
- * Compile: gcc -O3 -march=native -ffast-math -o gpt gpt.c -lm
+ * Compile: gcc -O3 -march=native -ffast-math -o micro-chatgpt micro-chatgpt.c -lm
  */
 
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <ctype.h>
 #include <string.h>
 
 #ifndef M_PI
@@ -109,10 +111,10 @@ static void build_tokenizer(void) {
 /* ------------------------------------------------------------------ */
 /*  Model hyper-parameters                                            */
 /* ------------------------------------------------------------------ */
-#define N_EMBD 32
+#define N_EMBD 64
 #define N_HEAD 4
-#define N_LAYER 1
-#define BLOCK_SIZE 8
+#define N_LAYER 2
+#define BLOCK_SIZE 128
 #define HEAD_DIM (N_EMBD / N_HEAD)
 #define MLP_DIM (4 * N_EMBD)
 
@@ -519,6 +521,91 @@ static void adam_update(float *p, float *g, float *m, float *v, int sz,
 }
 
 /* ------------------------------------------------------------------ */
+/*  Model save / load                                                 */
+/* ------------------------------------------------------------------ */
+#define MODEL_MAGIC 0x4D475054 /* "MGPT" */
+
+static void save_model(const char *filename) {
+  FILE *f = fopen(filename, "wb");
+  if (!f) {
+    fprintf(stderr, "Cannot open %s for writing\n", filename);
+    return;
+  }
+  unsigned int magic = MODEL_MAGIC;
+  int block_size = BLOCK_SIZE;
+  fwrite(&magic, 4, 1, f);
+  fwrite(&vocab_size, 4, 1, f);
+  fwrite(&num_uchars, 4, 1, f);
+  fwrite(&BOS, 4, 1, f);
+  fwrite(&block_size, 4, 1, f);
+  fwrite(uchars_arr, 1, num_uchars, f);
+
+  int es = vocab_size * N_EMBD, ps = BLOCK_SIZE * N_EMBD;
+  int as = N_EMBD * N_EMBD, ms = MLP_DIM * N_EMBD;
+  fwrite(wte, sizeof(float), es, f);
+  fwrite(wpe, sizeof(float), ps, f);
+  fwrite(lm_head, sizeof(float), es, f);
+  for (int i = 0; i < N_LAYER; i++) {
+    fwrite(attn_wq[i], sizeof(float), as, f);
+    fwrite(attn_wk[i], sizeof(float), as, f);
+    fwrite(attn_wv[i], sizeof(float), as, f);
+    fwrite(attn_wo[i], sizeof(float), as, f);
+    fwrite(mlp_fc1[i], sizeof(float), ms, f);
+    fwrite(mlp_fc2[i], sizeof(float), ms, f);
+  }
+  fclose(f);
+  printf("Model saved to %s\n", filename);
+}
+
+static int load_model(const char *filename) {
+  FILE *f = fopen(filename, "rb");
+  if (!f) {
+    fprintf(stderr, "Cannot open %s\n", filename);
+    return 0;
+  }
+  unsigned int magic;
+  fread(&magic, 4, 1, f);
+  if (magic != MODEL_MAGIC) {
+    fprintf(stderr, "Bad magic number in %s\n", filename);
+    fclose(f);
+    return 0;
+  }
+  int file_vocab, file_nuchars, file_bos, file_bs;
+  fread(&file_vocab, 4, 1, f);
+  fread(&file_nuchars, 4, 1, f);
+  fread(&file_bos, 4, 1, f);
+  fread(&file_bs, 4, 1, f);
+  if (file_bs != BLOCK_SIZE) {
+    fprintf(stderr, "BLOCK_SIZE mismatch: file=%d compiled=%d\n", file_bs,
+            BLOCK_SIZE);
+    fclose(f);
+    return 0;
+  }
+  vocab_size = file_vocab;
+  num_uchars = file_nuchars;
+  BOS = file_bos;
+  fread(uchars_arr, 1, num_uchars, f);
+
+  init_params();
+
+  int es = vocab_size * N_EMBD, ps = BLOCK_SIZE * N_EMBD;
+  int as = N_EMBD * N_EMBD, ms = MLP_DIM * N_EMBD;
+  fread(wte, sizeof(float), es, f);
+  fread(wpe, sizeof(float), ps, f);
+  fread(lm_head, sizeof(float), es, f);
+  for (int i = 0; i < N_LAYER; i++) {
+    fread(attn_wq[i], sizeof(float), as, f);
+    fread(attn_wk[i], sizeof(float), as, f);
+    fread(attn_wv[i], sizeof(float), as, f);
+    fread(attn_wo[i], sizeof(float), as, f);
+    fread(mlp_fc1[i], sizeof(float), ms, f);
+    fread(mlp_fc2[i], sizeof(float), ms, f);
+  }
+  fclose(f);
+  return 1;
+}
+
+/* ------------------------------------------------------------------ */
 /*  Weighted random choice                                            */
 /* ------------------------------------------------------------------ */
 static int weighted_choice(const float *w, int n) {
@@ -535,105 +622,187 @@ static int weighted_choice(const float *w, int n) {
 }
 
 /* ------------------------------------------------------------------ */
-/*  Main: training + inference                                        */
+/*  Prompted generation                                               */
 /* ------------------------------------------------------------------ */
-int main(void) {
-  load_dataset("input.txt");
+static void generate_from_prompt(const char *prompt, float temperature) {
+  memset(kv_keys, 0, sizeof(kv_keys));
+  memset(kv_vals, 0, sizeof(kv_vals));
 
-  int *doc_order = (int *)malloc(num_docs * sizeof(int));
-  for (int i = 0; i < num_docs; i++)
-    doc_order[i] = i;
-  shuffle_ints(doc_order, num_docs);
-  char (*docs_tmp)[MAX_DOC_LEN] = malloc((size_t)num_docs * MAX_DOC_LEN);
-  for (int i = 0; i < num_docs; i++)
-    memcpy(docs_tmp[i], docs[doc_order[i]], MAX_DOC_LEN);
-  memcpy(docs, docs_tmp, (size_t)num_docs * MAX_DOC_LEN);
-  free(docs_tmp);
-  free(doc_order);
+  PosActs tmp_act;
+  float logits[MAX_CHARS + 1], probs[MAX_CHARS + 1];
+  int pos = 0;
 
-  printf("num docs: %d\n", num_docs);
-  build_tokenizer();
-  printf("vocab size: %d\n", vocab_size);
-  init_params();
+  /* feed BOS */
+  gpt_forward(BOS, pos++, logits, &tmp_act);
 
-  float lr = 1e-2f, b1 = 0.9f, b2 = 0.95f, eps = 1e-8f;
-  int num_steps = 5000;
-
-  for (int step = 0; step < num_steps; step++) {
-    char *doc = docs[step % num_docs];
-    int doc_len = (int)strlen(doc);
-
-    int tokens[MAX_DOC_LEN + 2], targets[BLOCK_SIZE];
-    tokens[0] = BOS;
-    for (int i = 0; i < doc_len; i++)
-      tokens[i + 1] = char_to_id(doc[i]);
-    tokens[doc_len + 1] = BOS;
-    int n = BLOCK_SIZE < (doc_len + 1) ? BLOCK_SIZE : (doc_len + 1);
-
-    float total_loss = 0;
-    float logits[MAX_CHARS + 1];
-    for (int pos = 0; pos < n; pos++) {
-      targets[pos] = tokens[pos + 1];
-      gpt_forward(tokens[pos], pos, logits, &saved[pos]);
-      softmax_fwd(logits, vocab_size, saved_probs[pos]);
-      total_loss += -logf(saved_probs[pos][targets[pos]] + 1e-30f);
+  /* feed prompt tokens to prime KV cache */
+  int prompt_len = (int)strlen(prompt);
+  if (prompt_len > BLOCK_SIZE - 2) {
+    fprintf(stderr, "Warning: prompt truncated to %d characters\n",
+            BLOCK_SIZE - 2);
+    prompt_len = BLOCK_SIZE - 2;
+  }
+  for (int i = 0; i < prompt_len && pos < BLOCK_SIZE; i++) {
+    char ch = (char)tolower((unsigned char)prompt[i]);
+    int tid = char_to_id(ch);
+    if (tid < 0) {
+      fprintf(stderr, "Warning: skipping unknown character '%c'\n", prompt[i]);
+      continue;
     }
-    float loss = total_loss / n;
-
-    gpt_backward(n, tokens, targets);
-
-    float lr_t =
-        lr * 0.5f * (1.0f + cosf((float)M_PI * step / (float)num_steps));
-    int es = vocab_size * N_EMBD, ps = BLOCK_SIZE * N_EMBD;
-    int as = N_EMBD * N_EMBD, ms = MLP_DIM * N_EMBD;
-    adam_update(wte, d_wte, adam_m_wte, adam_v_wte, es, lr_t, b1, b2, eps,
-                step);
-    adam_update(wpe, d_wpe, adam_m_wpe, adam_v_wpe, ps, lr_t, b1, b2, eps,
-                step);
-    adam_update(lm_head, d_lm_head, adam_m_lm, adam_v_lm, es, lr_t, b1, b2, eps,
-                step);
-    for (int i = 0; i < N_LAYER; i++) {
-      adam_update(attn_wq[i], d_attn_wq[i], adam_m_wq[i], adam_v_wq[i], as,
-                  lr_t, b1, b2, eps, step);
-      adam_update(attn_wk[i], d_attn_wk[i], adam_m_wk[i], adam_v_wk[i], as,
-                  lr_t, b1, b2, eps, step);
-      adam_update(attn_wv[i], d_attn_wv[i], adam_m_wv[i], adam_v_wv[i], as,
-                  lr_t, b1, b2, eps, step);
-      adam_update(attn_wo[i], d_attn_wo[i], adam_m_wo[i], adam_v_wo[i], as,
-                  lr_t, b1, b2, eps, step);
-      adam_update(mlp_fc1[i], d_mlp_fc1[i], adam_m_fc1[i], adam_v_fc1[i], ms,
-                  lr_t, b1, b2, eps, step);
-      adam_update(mlp_fc2[i], d_mlp_fc2[i], adam_m_fc2[i], adam_v_fc2[i], ms,
-                  lr_t, b1, b2, eps, step);
-    }
-
-    printf("step %4d / %4d | loss %.4f\n", step + 1, num_steps, loss);
+    gpt_forward(tid, pos++, logits, &tmp_act);
   }
 
-  /* ---- Inference ---- */
+  /* autoregressive generation */
+  float inv_t = 1.0f / temperature;
+  while (pos < BLOCK_SIZE) {
+    for (int i = 0; i < vocab_size; i++)
+      logits[i] *= inv_t;
+    softmax_fwd(logits, vocab_size, probs);
+    int token_id = weighted_choice(probs, vocab_size);
+    if (token_id == BOS)
+      break;
+    if (token_id < num_uchars)
+      printf("%c", uchars_arr[token_id]);
+    gpt_forward(token_id, pos++, logits, &tmp_act);
+  }
+  printf("\n");
+  fflush(stdout);
+}
+
+/* ------------------------------------------------------------------ */
+/*  Interactive REPL                                                   */
+/* ------------------------------------------------------------------ */
+static void repl_loop(float temperature) {
+  char line[256];
+  printf("> ");
+  fflush(stdout);
+  while (fgets(line, sizeof(line), stdin)) {
+    int len = (int)strlen(line);
+    while (len > 0 && (line[len - 1] == '\n' || line[len - 1] == '\r'))
+      line[--len] = 0;
+    if (strcmp(line, "quit") == 0)
+      break;
+    if (len > 0)
+      generate_from_prompt(line, temperature);
+    printf("> ");
+    fflush(stdout);
+  }
+}
+
+/* ------------------------------------------------------------------ */
+/*  Main: training + inference                                        */
+/* ------------------------------------------------------------------ */
+int main(int argc, char *argv[]) {
+  const char *load_path = NULL;
+  const char *save_path = "model.bin";
+  const char *data_path = "input.txt";
+  const char *prompt = NULL;
+  int num_steps = 30000;
   float temperature = 0.5f;
-  printf("\n--- inference ---\n");
-  for (int si = 0; si < 20; si++) {
-    char sample[BLOCK_SIZE + 1];
-    int slen = 0, token_id = BOS;
-    PosActs tmp_act;
-    for (int pos = 0; pos < BLOCK_SIZE; pos++) {
-      float logits[MAX_CHARS + 1], probs[MAX_CHARS + 1];
-      gpt_forward(token_id, pos, logits, &tmp_act);
-      float inv_t = 1.0f / temperature;
-      for (int i = 0; i < vocab_size; i++)
-        logits[i] *= inv_t;
-      softmax_fwd(logits, vocab_size, probs);
-      token_id = weighted_choice(probs, vocab_size);
-      if (token_id == BOS)
-        break;
-      if (token_id < num_uchars)
-        sample[slen++] = uchars_arr[token_id];
+
+  for (int i = 1; i < argc; i++) {
+    if (strcmp(argv[i], "--load") == 0 && i + 1 < argc)
+      load_path = argv[++i];
+    else if (strcmp(argv[i], "--save") == 0 && i + 1 < argc)
+      save_path = argv[++i];
+    else if (strcmp(argv[i], "--data") == 0 && i + 1 < argc)
+      data_path = argv[++i];
+    else if (strcmp(argv[i], "--steps") == 0 && i + 1 < argc)
+      num_steps = atoi(argv[++i]);
+    else if (strcmp(argv[i], "--prompt") == 0 && i + 1 < argc)
+      prompt = argv[++i];
+    else if (strcmp(argv[i], "--temperature") == 0 && i + 1 < argc)
+      temperature = (float)atof(argv[++i]);
+    else {
+      fprintf(stderr, "Unknown option: %s\n", argv[i]);
+      return 1;
     }
-    sample[slen] = '\0';
-    printf("sample %2d: %s\n", si + 1, sample);
-    memset(kv_keys, 0, sizeof(kv_keys));
-    memset(kv_vals, 0, sizeof(kv_vals));
+  }
+
+  if (load_path) {
+    if (!load_model(load_path))
+      return 1;
+    printf("Model loaded from %s\n", load_path);
+  } else {
+    load_dataset(data_path);
+
+    int *doc_order = (int *)malloc(num_docs * sizeof(int));
+    for (int i = 0; i < num_docs; i++)
+      doc_order[i] = i;
+    shuffle_ints(doc_order, num_docs);
+    char (*docs_tmp)[MAX_DOC_LEN] = malloc((size_t)num_docs * MAX_DOC_LEN);
+    for (int i = 0; i < num_docs; i++)
+      memcpy(docs_tmp[i], docs[doc_order[i]], MAX_DOC_LEN);
+    memcpy(docs, docs_tmp, (size_t)num_docs * MAX_DOC_LEN);
+    free(docs_tmp);
+    free(doc_order);
+
+    printf("num docs: %d\n", num_docs);
+    build_tokenizer();
+    printf("vocab size: %d\n", vocab_size);
+    init_params();
+
+    float lr = 1e-2f, b1 = 0.9f, b2 = 0.95f, eps = 1e-8f;
+
+    for (int step = 0; step < num_steps; step++) {
+      char *doc = docs[step % num_docs];
+      int doc_len = (int)strlen(doc);
+
+      int tokens[MAX_DOC_LEN + 2], targets[BLOCK_SIZE];
+      tokens[0] = BOS;
+      for (int i = 0; i < doc_len; i++)
+        tokens[i + 1] = char_to_id(doc[i]);
+      tokens[doc_len + 1] = BOS;
+      int n = BLOCK_SIZE < (doc_len + 1) ? BLOCK_SIZE : (doc_len + 1);
+
+      float total_loss = 0;
+      float logits[MAX_CHARS + 1];
+      for (int pos = 0; pos < n; pos++) {
+        targets[pos] = tokens[pos + 1];
+        gpt_forward(tokens[pos], pos, logits, &saved[pos]);
+        softmax_fwd(logits, vocab_size, saved_probs[pos]);
+        total_loss += -logf(saved_probs[pos][targets[pos]] + 1e-30f);
+      }
+      float loss = total_loss / n;
+
+      gpt_backward(n, tokens, targets);
+
+      float lr_t =
+          lr * 0.5f * (1.0f + cosf((float)M_PI * step / (float)num_steps));
+      int es = vocab_size * N_EMBD, ps = BLOCK_SIZE * N_EMBD;
+      int as = N_EMBD * N_EMBD, ms = MLP_DIM * N_EMBD;
+      adam_update(wte, d_wte, adam_m_wte, adam_v_wte, es, lr_t, b1, b2, eps,
+                  step);
+      adam_update(wpe, d_wpe, adam_m_wpe, adam_v_wpe, ps, lr_t, b1, b2, eps,
+                  step);
+      adam_update(lm_head, d_lm_head, adam_m_lm, adam_v_lm, es, lr_t, b1, b2,
+                  eps, step);
+      for (int i = 0; i < N_LAYER; i++) {
+        adam_update(attn_wq[i], d_attn_wq[i], adam_m_wq[i], adam_v_wq[i], as,
+                    lr_t, b1, b2, eps, step);
+        adam_update(attn_wk[i], d_attn_wk[i], adam_m_wk[i], adam_v_wk[i], as,
+                    lr_t, b1, b2, eps, step);
+        adam_update(attn_wv[i], d_attn_wv[i], adam_m_wv[i], adam_v_wv[i], as,
+                    lr_t, b1, b2, eps, step);
+        adam_update(attn_wo[i], d_attn_wo[i], adam_m_wo[i], adam_v_wo[i], as,
+                    lr_t, b1, b2, eps, step);
+        adam_update(mlp_fc1[i], d_mlp_fc1[i], adam_m_fc1[i], adam_v_fc1[i], ms,
+                    lr_t, b1, b2, eps, step);
+        adam_update(mlp_fc2[i], d_mlp_fc2[i], adam_m_fc2[i], adam_v_fc2[i], ms,
+                    lr_t, b1, b2, eps, step);
+      }
+
+      printf("step %4d / %4d | loss %.4f\n", step + 1, num_steps, loss);
+    }
+
+    save_model(save_path);
+  }
+
+  if (load_path) {
+    if (prompt)
+      generate_from_prompt(prompt, temperature);
+    else
+      repl_loop(temperature);
   }
 
   /* cleanup */
