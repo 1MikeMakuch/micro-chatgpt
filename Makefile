@@ -6,7 +6,7 @@ micro-chatgpt: micro-chatgpt.c
 	$(CC) $(CFLAGS) -o $@ $< $(LDFLAGS)
 
 train: micro-chatgpt
-	./micro-chatgpt --data chat.txt --steps 30000
+	./micro-chatgpt --data chat.txt --steps 100000
 	@echo ""
 	@echo "Run: ./micro-chatgpt --load model.bin --temperature 0.5"
 

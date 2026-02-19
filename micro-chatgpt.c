@@ -117,6 +117,7 @@ static void build_tokenizer(void) {
 #define BLOCK_SIZE 128
 #define HEAD_DIM (N_EMBD / N_HEAD)
 #define MLP_DIM (4 * N_EMBD)
+#define DROP_RATE 0.2f
 
 /* ------------------------------------------------------------------ */
 /*  Parameters & gradients (float arrays)                             */
@@ -219,6 +220,8 @@ typedef struct {
   float mlp_pre[N_LAYER][MLP_DIM];
   float mlp_post[N_LAYER][MLP_DIM];
   float x_out[N_EMBD];
+  char drop_attn[N_LAYER][N_EMBD];
+  char drop_mlp[N_LAYER][N_EMBD];
 } PosActs;
 
 static PosActs saved[BLOCK_SIZE];
@@ -309,7 +312,7 @@ static inline void rmsnorm_bwd(const float *x, float scale, const float *dout,
 /*  GPT forward pass (one token, fills saved acts)                    */
 /* ------------------------------------------------------------------ */
 static void gpt_forward(int token_id, int pos_id, float *logits_out,
-                        PosActs *act) {
+                        PosActs *act, int training) {
   float x[N_EMBD], tmp[MLP_DIM > N_EMBD ? MLP_DIM : N_EMBD];
 
   for (int i = 0; i < N_EMBD; i++)
@@ -370,6 +373,13 @@ static void gpt_forward(int token_id, int pos_id, float *logits_out,
     memcpy(act->attn_out[li], ao, sizeof(ao));
 
     linear_fwd(ao, attn_wo[li], N_EMBD, N_EMBD, tmp);
+    if (training) {
+      float s = 1.0f / (1.0f - DROP_RATE);
+      for (int i = 0; i < N_EMBD; i++) {
+        act->drop_attn[li][i] = rng_uniform() >= DROP_RATE ? 1 : 0;
+        tmp[i] *= act->drop_attn[li][i] * s;
+      }
+    }
     for (int i = 0; i < N_EMBD; i++)
       x[i] = tmp[i] + act->x_in[li][i];
     memcpy(act->x_mid[li], x, sizeof(x));
@@ -388,6 +398,13 @@ static void gpt_forward(int token_id, int pos_id, float *logits_out,
     memcpy(act->mlp_post[li], h2, MLP_DIM * sizeof(float));
 
     linear_fwd(h2, mlp_fc2[li], N_EMBD, MLP_DIM, tmp);
+    if (training) {
+      float s = 1.0f / (1.0f - DROP_RATE);
+      for (int i = 0; i < N_EMBD; i++) {
+        act->drop_mlp[li][i] = rng_uniform() >= DROP_RATE ? 1 : 0;
+        tmp[i] *= act->drop_mlp[li][i] * s;
+      }
+    }
     for (int i = 0; i < N_EMBD; i++)
       x[i] = tmp[i] + act->x_mid[li][i];
   }
@@ -418,11 +435,15 @@ static void gpt_backward(int n, const int *tokens, const int *targets) {
     linear_bwd_w(act->x_out, dl, vocab_size, N_EMBD, d_lm_head);
 
     for (int li = N_LAYER - 1; li >= 0; li--) {
-      /* MLP backward */
+      /* MLP backward (apply dropout mask) */
+      float dx_mlp[N_EMBD];
+      float drop_s = 1.0f / (1.0f - DROP_RATE);
+      for (int i = 0; i < N_EMBD; i++)
+        dx_mlp[i] = dx[i] * act->drop_mlp[li][i] * drop_s;
       float d_h2[MLP_DIM];
       memset(d_h2, 0, sizeof(d_h2));
-      linear_bwd_x(mlp_fc2[li], dx, N_EMBD, MLP_DIM, d_h2);
-      linear_bwd_w(act->mlp_post[li], dx, N_EMBD, MLP_DIM, d_mlp_fc2[li]);
+      linear_bwd_x(mlp_fc2[li], dx_mlp, N_EMBD, MLP_DIM, d_h2);
+      linear_bwd_w(act->mlp_post[li], dx_mlp, N_EMBD, MLP_DIM, d_mlp_fc2[li]);
 
       float d_h1[MLP_DIM];
       for (int i = 0; i < MLP_DIM; i++)
@@ -441,11 +462,14 @@ static void gpt_backward(int n, const int *tokens, const int *targets) {
       for (int i = 0; i < N_EMBD; i++)
         dx[i] += d_x_mid[i];
 
-      /* Attention backward */
+      /* Attention backward (apply dropout mask) */
+      float dx_attn[N_EMBD];
+      for (int i = 0; i < N_EMBD; i++)
+        dx_attn[i] = dx[i] * act->drop_attn[li][i] * drop_s;
       float d_ao[N_EMBD];
       memset(d_ao, 0, sizeof(d_ao));
-      linear_bwd_x(attn_wo[li], dx, N_EMBD, N_EMBD, d_ao);
-      linear_bwd_w(act->attn_out[li], dx, N_EMBD, N_EMBD, d_attn_wo[li]);
+      linear_bwd_x(attn_wo[li], dx_attn, N_EMBD, N_EMBD, d_ao);
+      linear_bwd_w(act->attn_out[li], dx_attn, N_EMBD, N_EMBD, d_attn_wo[li]);
 
       float d_q[N_EMBD];
       memset(d_q, 0, sizeof(d_q));
@@ -633,7 +657,7 @@ static void generate_from_prompt(const char *prompt, float temperature) {
   int pos = 0;
 
   /* feed BOS */
-  gpt_forward(BOS, pos++, logits, &tmp_act);
+  gpt_forward(BOS, pos++, logits, &tmp_act, 0);
 
   /* feed prompt tokens to prime KV cache */
   int prompt_len = (int)strlen(prompt);
@@ -649,7 +673,7 @@ static void generate_from_prompt(const char *prompt, float temperature) {
       fprintf(stderr, "Warning: skipping unknown character '%c'\n", prompt[i]);
       continue;
     }
-    gpt_forward(tid, pos++, logits, &tmp_act);
+    gpt_forward(tid, pos++, logits, &tmp_act, 0);
   }
 
   /* autoregressive generation */
@@ -663,7 +687,7 @@ static void generate_from_prompt(const char *prompt, float temperature) {
       break;
     if (token_id < num_uchars)
       printf("%c", uchars_arr[token_id]);
-    gpt_forward(token_id, pos++, logits, &tmp_act);
+    gpt_forward(token_id, pos++, logits, &tmp_act, 0);
   }
   printf("\n");
   fflush(stdout);
@@ -695,9 +719,9 @@ static void repl_loop(float temperature) {
 int main(int argc, char *argv[]) {
   const char *load_path = NULL;
   const char *save_path = "model.bin";
-  const char *data_path = "input.txt";
+  const char *data_path = "chat.txt";
   const char *prompt = NULL;
-  int num_steps = 30000;
+  int num_steps = 100000;
   float temperature = 0.5f;
 
   for (int i = 1; i < argc; i++) {
@@ -742,7 +766,7 @@ int main(int argc, char *argv[]) {
     printf("vocab size: %d\n", vocab_size);
     init_params();
 
-    float lr = 1e-2f, b1 = 0.9f, b2 = 0.95f, eps = 1e-8f;
+    float lr = 1e-3f, b1 = 0.9f, b2 = 0.95f, eps = 1e-8f;
 
     for (int step = 0; step < num_steps; step++) {
       char *doc = docs[step % num_docs];
@@ -759,7 +783,7 @@ int main(int argc, char *argv[]) {
       float logits[MAX_CHARS + 1];
       for (int pos = 0; pos < n; pos++) {
         targets[pos] = tokens[pos + 1];
-        gpt_forward(tokens[pos], pos, logits, &saved[pos]);
+        gpt_forward(tokens[pos], pos, logits, &saved[pos], 1);
         softmax_fwd(logits, vocab_size, saved_probs[pos]);
         total_loss += -logf(saved_probs[pos][targets[pos]] + 1e-30f);
       }
@@ -792,7 +816,8 @@ int main(int argc, char *argv[]) {
                     lr_t, b1, b2, eps, step);
       }
 
-      printf("step %4d / %4d | loss %.4f\n", step + 1, num_steps, loss);
+      if (0 == step % 1000 || step == num_steps - 1)
+        printf("step %5d / %5d | loss %.4f\n", step + 1, num_steps, loss);
     }
 
     save_model(save_path);
