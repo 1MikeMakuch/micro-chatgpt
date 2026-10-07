@@ -24,3 +24,4 @@ make train      # ./micro-chatgpt --data chat.txt --steps 100000 (~5 mins)
 In interactive mode, type a prompt and press Enter. Type `quit` to exit.
 
 Look at the training data, chat.txt and use some or parts of those phrases to prompt it.
+
